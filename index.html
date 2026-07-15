@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Flame</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    background: #000;
+    overflow: hidden;
+  }
+  canvas {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
+    touch-action: none;
+    cursor: crosshair;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<!-- Общий вершинный шейдер: полноэкранный треугольник -->
+<script id="vs" type="x-shader/x-vertex">
+attribute vec2 aPos;
+varying vec2 vUv;
+void main() {
+  vUv = aPos * 0.5 + 0.5;
+  gl_Position = vec4(aPos, 0.0, 1.0);
+}
+</script>
+
+<!-- Шаг симуляции: адвекция тепла вверх с турбулентностью, охлаждением,
+     источником у нижней кромки и обтеканием точек нажатия -->
+<script id="fs-sim" type="x-shader/x-fragment">
+precision highp float;
+varying vec2 vUv;
+uniform sampler2D uPrev;
+uniform vec2  uTexel;      // 1 / разрешение симуляции
+uniform float uTime;
+uniform float uDt;         // множитель времени, 1.0 при 60 fps
+uniform float uAspect;     // ширина/высота
+uniform vec3  uPtr[4];     // xy — точка нажатия (изотропные коорд.), z — радиус (0 = неактивна)
+uniform float uDither;     // 1.0 для 8-битного фолбэка, иначе 0.0
+
+float hash(vec2 p) {
+  p = fract(p * vec2(123.34, 456.21));
+  p += dot(p, p + 45.32);
+  return fract(p.x * p.y);
+}
+
+float noise(vec2 p) {
+  vec2 i = floor(p);
+  vec2 f = fract(p);
+  vec2 u = f * f * (3.0 - 2.0 * f);
+  float a = hash(i);
+  float b = hash(i + vec2(1.0, 0.0));
+  float c = hash(i + vec2(0.0, 1.0));
+  float d = hash(i + vec2(1.0, 1.0));
+  return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+
+float fbm(vec2 p) {
+  float v = 0.0;
+  float a = 0.5;
+  for (int i = 0; i < 4; i++) {
+    v += a * noise(p);
+    p = p * 2.03 + vec2(17.3, 9.1);
+    a *= 0.5;
+  }
+  return v;
+}
+
+float heatAt(vec2 uv) {
+  if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) return 0.0;
+  return texture2D(uPrev, uv).r;
+}
+
+void main() {
+  vec2 uv = vUv;
+  vec2 p = vec2(uv.x * uAspect, uv.y); // изотропное пространство
+  float t = uTime;
+
+  // Турбулентность как curl noise: бездивергентное поле не создаёт
+  // «стиральной доски» из сжатых слоёв тепла
+  vec2 q = p * 3.0 + vec2(0.0, -t * 0.55);
+  float e = 0.02;
+  float psiT = fbm(q + vec2(0.0, e));
+  float psiB = fbm(q - vec2(0.0, e));
+  float psiR = fbm(q + vec2(e, 0.0));
+  float psiL = fbm(q - vec2(e, 0.0));
+  vec2 curl = vec2(psiT - psiB, psiL - psiR) / (2.0 * e);
+  float turbAmp = mix(0.4, 1.9, uv.y);
+  // Пульсация подъёма зависит только от x и времени: перепад скорости по
+  // вертикали сжимал бы поле тепла в горизонтальные полосы
+  float rise = mix(2.8, 3.6, uv.y) * (0.85 + 0.4 * fbm(vec2(p.x * 2.5, t * 0.9)));
+  // Сужение потока к центру с высотой — конический силуэт пламени
+  float inflow = (0.5 * uAspect - p.x) / (0.5 * uAspect) * 1.3 * uv.y;
+  vec2 vel = vec2(inflow, rise) + curl * turbAmp;
+
+  // Обтекание точек нажатия: радиальный поток от центра расталкивает пламя
+  float block = 1.0;
+  for (int i = 0; i < 4; i++) {
+    float R = uPtr[i].z;
+    if (R <= 0.0) continue;
+    vec2 d = p - uPtr[i].xy;
+    float r = length(d) + 1e-5;
+    float f = exp(-(r * r) / (R * R) * 1.6);
+    vel += (d / r) * 14.0 * f;                       // поток в стороны от касания
+    block *= smoothstep(R * 0.35, R * 0.75, r);      // «дыра» в самом центре
+  }
+
+  // Источник тепла — точка выше по потоку (снизу и по смещению турбулентности)
+  vec2 src = uv - vel * uTexel * uDt;
+
+  // Лёгкая диффузия: пламя расширяется и сглаживается
+  float h = 0.0;
+  h += heatAt(src) * 0.40;
+  h += heatAt(src + vec2(uTexel.x, 0.0)) * 0.15;
+  h += heatAt(src - vec2(uTexel.x, 0.0)) * 0.15;
+  h += heatAt(src - vec2(0.0, uTexel.y)) * 0.20;
+  h += heatAt(src + vec2(0.0, uTexel.y)) * 0.10;
+
+  // Охлаждение, промодулированное шумом, — даёт рваные «языки» пламени
+  // Шум охлаждения частый по x и гладкий по y: тёмные промежутки идут
+  // вертикально, разделяя пламя на отдельные языки
+  float coolNoise = fbm(vec2(p.x * 6.0, p.y * 1.3) + vec2(t * 0.4, -t * 1.1));
+  // Охлаждение нормировано на вертикальную скорость (теряем тепло на единицу
+  // высоты, а не времени) — колебания скорости не печатают горизонтальных слоёв
+  float cool = 0.0052 * mix(0.5, 2.0, uv.y) * (0.05 + 2.3 * coolNoise)
+             * clamp(vel.y / 2.8, 0.3, 2.0);
+  h -= cool * uDt;
+
+  // Источник: толстая полоса огня у нижней кромки с плавным затуханием
+  // по высоте — мерцание не отпечатывается резкими слоями
+  if (uv.y < 0.06) {
+    float x = uv.x;
+    float base = smoothstep(0.18, 0.36, x) * smoothstep(0.82, 0.64, x);
+    float flick = 0.55 + 0.7 * fbm(vec2(x * uAspect * 10.0, t * 1.6));
+    float env = smoothstep(0.06, 0.025, uv.y);
+    float s = min(base * flick * 1.25, 1.0) * env;
+    // Нагрев пропорционален пройденной высоте (как и охлаждение), иначе
+    // колебания скорости печатают горизонтальные слои яркости
+    float rate = min(0.35 * clamp(vel.y / 2.8, 0.3, 2.0) * uDt, 1.0);
+    h = mix(h, max(h, s), rate);
+  }
+
+  h *= block;
+
+  // Дизеринг против ступенчатых полос при 8-битном хранении тепла
+  h += (hash(uv * 913.7 + fract(t * 7.31)) - 0.5) * (uDither / 255.0);
+
+  gl_FragColor = vec4(clamp(h, 0.0, 1.0), 0.0, 0.0, 1.0);
+}
+</script>
+
+<!-- Вывод на экран: тепло -> цвет огня + мягкое свечение -->
+<script id="fs-draw" type="x-shader/x-fragment">
+precision highp float;
+varying vec2 vUv;
+uniform sampler2D uTex;
+uniform vec2 uTexel;
+uniform float uTime;
+
+float hash(vec2 p) {
+  p = fract(p * vec2(123.34, 456.21));
+  p += dot(p, p + 45.32);
+  return fract(p.x * p.y);
+}
+
+// Оранжевое пламя: тёмно-красный -> оранжевый -> почти белый
+vec3 fireOrange(float x) {
+  vec3 c = vec3(
+    pow(x, 0.85) * 1.9,
+    pow(x, 1.85) * 1.75,
+    pow(x, 4.5)  * 1.5
+  );
+  return 1.0 - exp(-c * 1.6); // мягкое тональное сжатие
+}
+
+// Голубое пламя (как у газовой горелки): синий -> ярко-голубой
+vec3 fireBlue(float x) {
+  vec3 c = vec3(
+    pow(x, 4.0) * 0.75,
+    pow(x, 1.9) * 1.35,
+    pow(x, 0.7) * 2.6
+  );
+  return 1.0 - exp(-c * 1.6);
+}
+
+void main() {
+  float h = clamp(texture2D(uTex, vUv).r, 0.0, 1.0);
+
+  // Дешёвое свечение вокруг ярких областей
+  float glow = 0.0;
+  glow += texture2D(uTex, vUv + vec2( uTexel.x * 5.0, 0.0)).r;
+  glow += texture2D(uTex, vUv + vec2(-uTexel.x * 5.0, 0.0)).r;
+  glow += texture2D(uTex, vUv + vec2(0.0,  uTexel.y * 5.0)).r;
+  glow += texture2D(uTex, vUv + vec2(0.0, -uTexel.y * 5.0)).r;
+  glow *= 0.25;
+
+  // Градиент по высоте: ярко-голубое основание переходит в оранжевый верх
+  float m = smoothstep(0.06, 0.38, vUv.y);
+  vec3 col = mix(fireBlue(h), fireOrange(h), m);
+  vec3 glowTint = mix(vec3(0.25, 0.6, 1.0), vec3(1.0, 0.42, 0.10), m);
+  col += glowTint * glow * glow * 0.22;
+
+  // Дизеринг против полос на плавных градиентах
+  col += (hash(vUv * 1234.5 + fract(uTime)) - 0.5) / 255.0;
+
+  gl_FragColor = vec4(col, 1.0);
+}
+</script>
+
+<script>
+(function () {
+  'use strict';
+
+  var canvas = document.getElementById('c');
+  var glOpts = { antialias: false, alpha: false, preserveDrawingBuffer: false };
+  var isGL2 = true;
+  var gl = canvas.getContext('webgl2', glOpts);
+  if (!gl) {
+    isGL2 = false;
+    gl = canvas.getContext('webgl', glOpts) || canvas.getContext('experimental-webgl', glOpts);
+  }
+  if (!gl) {
+    document.body.textContent = 'WebGL не поддерживается';
+    document.body.style.color = '#666';
+    return;
+  }
+
+  // Формат текстур поля тепла: half-float, если доступен рендеринг в него,
+  // иначе 8 бит + дизеринг в шейдере
+  var texType = gl.UNSIGNED_BYTE;
+  var texInternal = gl.RGBA;
+  if (isGL2 && gl.getExtension('EXT_color_buffer_float')) {
+    texType = gl.HALF_FLOAT;
+    texInternal = gl.RGBA16F;
+  } else if (!isGL2) {
+    var extHF = gl.getExtension('OES_texture_half_float');
+    if (extHF && gl.getExtension('OES_texture_half_float_linear')) {
+      texType = extHF.HALF_FLOAT_OES;
+    }
+  }
+
+  function compile(type, src) {
+    var s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+      throw new Error(gl.getShaderInfoLog(s));
+    }
+    return s;
+  }
+
+  function program(fsId) {
+    var p = gl.createProgram();
+    gl.attachShader(p, compile(gl.VERTEX_SHADER, document.getElementById('vs').textContent));
+    gl.attachShader(p, compile(gl.FRAGMENT_SHADER, document.getElementById(fsId).textContent));
+    gl.bindAttribLocation(p, 0, 'aPos');
+    gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+      throw new Error(gl.getProgramInfoLog(p));
+    }
+    return p;
+  }
+
+  var simProg = program('fs-sim');
+  var drawProg = program('fs-draw');
+
+  // Полноэкранный треугольник
+  var buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+
+  var uni = {
+    sim: {
+      prev:   gl.getUniformLocation(simProg, 'uPrev'),
+      texel:  gl.getUniformLocation(simProg, 'uTexel'),
+      time:   gl.getUniformLocation(simProg, 'uTime'),
+      dt:     gl.getUniformLocation(simProg, 'uDt'),
+      aspect: gl.getUniformLocation(simProg, 'uAspect'),
+      ptr:    gl.getUniformLocation(simProg, 'uPtr'),
+      dither: gl.getUniformLocation(simProg, 'uDither')
+    },
+    draw: {
+      tex:   gl.getUniformLocation(drawProg, 'uTex'),
+      texel: gl.getUniformLocation(drawProg, 'uTexel'),
+      time:  gl.getUniformLocation(drawProg, 'uTime')
+    }
+  };
+
+  // Пинг-понг текстуры симуляции (8 бит достаточно для поля тепла)
+  var simW = 0, simH = 0;
+  var tex = [null, null];
+  var fbo = [null, null];
+  var cur = 0;
+
+  function makeTarget(w, h) {
+    var t = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.texImage2D(gl.TEXTURE_2D, 0, texInternal, w, h, 0, gl.RGBA, texType, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    var f = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, f);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
+    if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE
+        && texType !== gl.UNSIGNED_BYTE) {
+      // Рендеринг в half-float не поддерживается — откат на 8 бит
+      texType = gl.UNSIGNED_BYTE;
+      texInternal = gl.RGBA;
+      gl.deleteTexture(t);
+      gl.deleteFramebuffer(f);
+      return makeTarget(w, h);
+    }
+    gl.clearColor(0, 0, 0, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    return { tex: t, fbo: f };
+  }
+
+  function resize() {
+    var dpr = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width = Math.round(canvas.clientWidth * dpr);
+    canvas.height = Math.round(canvas.clientHeight * dpr);
+
+    // Симуляция на пониженном разрешении: быстрее и «мягче»
+    var h = Math.min(480, Math.max(200, Math.round(canvas.clientHeight * 0.5)));
+    var w = Math.min(960, Math.max(200, Math.round(h * canvas.clientWidth / Math.max(1, canvas.clientHeight))));
+    if (w === simW && h === simH) return;
+    simW = w; simH = h;
+
+    for (var i = 0; i < 2; i++) {
+      if (tex[i]) { gl.deleteTexture(tex[i]); gl.deleteFramebuffer(fbo[i]); }
+      var target = makeTarget(w, h);
+      tex[i] = target.tex;
+      fbo[i] = target.fbo;
+    }
+  }
+
+  window.addEventListener('resize', resize);
+  resize();
+
+  // Указатели: пламя обтекает точку, пока она нажата
+  var pointers = {};                 // pointerId -> {x, y} в клиентских координатах
+  var ptrData = new Float32Array(12); // 4 x vec3
+
+  function setPointer(e) {
+    pointers[e.pointerId] = { x: e.clientX, y: e.clientY };
+  }
+
+  canvas.addEventListener('pointerdown', function (e) {
+    e.preventDefault();
+    if (canvas.setPointerCapture) {
+      try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
+    }
+    setPointer(e);
+  });
+  canvas.addEventListener('pointermove', function (e) {
+    if (pointers[e.pointerId]) setPointer(e);
+  });
+  function releasePointer(e) { delete pointers[e.pointerId]; }
+  canvas.addEventListener('pointerup', releasePointer);
+  canvas.addEventListener('pointercancel', releasePointer);
+  canvas.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+
+  function fillPointerUniform() {
+    var aspect = simW / simH;
+    var i = 0;
+    for (var id in pointers) {
+      if (i >= 4) break;
+      var pt = pointers[id];
+      var u = pt.x / Math.max(1, canvas.clientWidth);
+      var v = 1.0 - pt.y / Math.max(1, canvas.clientHeight);
+      ptrData[i * 3 + 0] = u * aspect;
+      ptrData[i * 3 + 1] = v;
+      // Радиус влияния в долях высоты; на узких (мобильных) экранах меньше,
+      // чтобы палец не перекрывал всю ширину пламени
+      ptrData[i * 3 + 2] = 0.16 * Math.max(0.55, Math.min(1, aspect / 1.2));
+      i++;
+    }
+    for (; i < 4; i++) ptrData[i * 3 + 2] = 0.0;
+  }
+
+  var last = performance.now();
+  var start = last;
+  var dtSmooth = 1.0;
+
+  function frame(now) {
+    requestAnimationFrame(frame);
+
+    // Сглаживание шага времени: резкие скачки dt печатают в поле тепла
+    // горизонтальные полосы
+    var dtRaw = Math.min(Math.max((now - last) / (1000 / 60), 0.25), 2.5);
+    dtSmooth += (dtRaw - dtSmooth) * 0.06;
+    var dt = dtSmooth;
+    last = now;
+    var time = (now - start) / 1000;
+
+    fillPointerUniform();
+
+    // Шаг симуляции
+    var next = 1 - cur;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo[next]);
+    gl.viewport(0, 0, simW, simH);
+    gl.useProgram(simProg);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, tex[cur]);
+    gl.uniform1i(uni.sim.prev, 0);
+    gl.uniform2f(uni.sim.texel, 1 / simW, 1 / simH);
+    gl.uniform1f(uni.sim.time, time);
+    gl.uniform1f(uni.sim.dt, dt);
+    gl.uniform1f(uni.sim.aspect, simW / simH);
+    gl.uniform3fv(uni.sim.ptr, ptrData);
+    gl.uniform1f(uni.sim.dither, texType === gl.UNSIGNED_BYTE ? 1.0 : 0.0);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    cur = next;
+
+    // Вывод на экран
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    gl.useProgram(drawProg);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, tex[cur]);
+    gl.uniform1i(uni.draw.tex, 0);
+    gl.uniform2f(uni.draw.texel, 1 / simW, 1 / simH);
+    gl.uniform1f(uni.draw.time, time);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+  }
+
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
